@@ -119,6 +119,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const data = JSON.parse(body || '{}');
         const filePaths = data.filePaths || data.paths;
+        const useNativeBatch = data.useNativeBatch !== false;
 
         if (!Array.isArray(filePaths) || filePaths.length === 0) {
           sendResponse(res, 400, {
@@ -128,10 +129,101 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        const deduped = [...new Set(filePaths)];
         const purger = new CdnPurger({});
+
+        if (useNativeBatch && deduped.length > 1) {
+          try {
+            const batchResult = await purger.purgeBatchWithRetry(deduped);
+
+            batchResult.successPaths.forEach((p) => {
+              recorder.recordSuccess(p, purger.buildFullUrl(p), purger.provider);
+            });
+
+            sendResponse(res, 200, {
+              success: true,
+              mode: 'native-batch',
+              total: batchResult.total,
+              successCount: batchResult.successCount,
+              failCount: batchResult.failCount,
+              batchSize: batchResult.batchSize,
+              totalBatches: batchResult.totalBatches,
+              totalDuration: batchResult.totalDuration,
+              provider: purger.provider,
+              batchResults: batchResult.batchResults.map((b) => ({
+                batchIndex: b.batchIndex,
+                totalBatches: b.totalBatches,
+                count: b.count,
+                success: b.success,
+                retried: b.retried,
+                attempts: b.attempts.length,
+                duration: b.duration,
+                paths: b.paths,
+                result: b.result,
+                error: b.error
+              })),
+              successPaths: batchResult.successPaths,
+              failedPaths: []
+            });
+          } catch (batchFailure) {
+            batchFailure.successPaths.forEach((p) => {
+              recorder.recordSuccess(p, purger.buildFullUrl(p), purger.provider);
+            });
+
+            const failedPathIds = [];
+            batchFailure.failedPaths.forEach((p) => {
+              const failedBatch = batchFailure.batchResults.find(
+                (b) => !b.success && b.paths.includes(p)
+              );
+              const perFileFailure = {
+                success: false,
+                filePath: p,
+                fullUrl: purger.buildFullUrl(p),
+                provider: purger.provider,
+                attempts: failedBatch ? failedBatch.attempts : [],
+                finalAttempt: failedBatch ? failedBatch.finalAttempt : 1,
+                error: failedBatch?.error || {
+                  message: 'Batch purge failed',
+                  code: 'BATCH_FAILED'
+                },
+                timestamp: batchFailure.timestamp
+              };
+              const rec = recorder.record(perFileFailure);
+              failedPathIds.push({ filePath: p, failureId: rec.id });
+            });
+
+            sendResponse(res, 207, {
+              success: false,
+              mode: 'native-batch',
+              total: batchFailure.total,
+              successCount: batchFailure.successCount,
+              failCount: batchFailure.failCount,
+              batchSize: batchFailure.batchSize,
+              totalBatches: batchFailure.totalBatches,
+              totalDuration: batchFailure.totalDuration,
+              provider: purger.provider,
+              batchResults: batchFailure.batchResults.map((b) => ({
+                batchIndex: b.batchIndex,
+                totalBatches: b.totalBatches,
+                count: b.count,
+                success: b.success,
+                retried: b.retried,
+                attempts: b.attempts.length,
+                duration: b.duration,
+                paths: b.paths,
+                result: b.result,
+                error: b.error
+              })),
+              successPaths: batchFailure.successPaths,
+              failedPaths: failedPathIds
+            });
+          }
+          return;
+        }
+
         const results = [];
 
-        for (const filePath of filePaths) {
+        for (const filePath of deduped) {
           try {
             const result = await purger.purgeWithRetry(filePath);
 
@@ -169,7 +261,8 @@ const server = http.createServer(async (req, res) => {
 
         sendResponse(res, allSuccess ? 200 : 207, {
           success: allSuccess,
-          total: filePaths.length,
+          mode: 'per-file',
+          total: deduped.length,
           successCount: results.filter(r => r.success).length,
           failCount: results.filter(r => !r.success).length,
           provider: purger.provider,
@@ -378,7 +471,7 @@ const server = http.createServer(async (req, res) => {
     availableEndpoints: [
       { method: 'GET', path: '/health', description: 'Health check' },
       { method: 'POST', path: '/api/purge', description: 'Purge single file cache (with retry)', body: { filePath: 'string' } },
-      { method: 'POST', path: '/api/purge-batch', description: 'Purge multiple files cache (with retry)', body: { filePaths: 'string[]' } },
+      { method: 'POST', path: '/api/purge-batch', description: 'Purge multiple files in batch (native batch API + retry)', body: { filePaths: 'string[]', useNativeBatch: 'boolean (default true)' } },
       { method: 'GET', path: '/api/purge-failures', description: 'Query failure records', query: { status: 'pending|resolved', provider: 'string', limit: 'number', offset: 'number' } },
       { method: 'GET', path: '/api/purge-failures/stats', description: 'Get failure statistics' },
       { method: 'GET', path: '/api/purge-failures/:id', description: 'Get a single failure record' },
@@ -420,6 +513,7 @@ function sendResponse(res, statusCode, data) {
 }
 
 server.listen(PORT, () => {
+  const samplePurger = new CdnPurger({});
   console.log(`
   ██████╗ ██████╗ ███╗   ██╗    ██████╗ ██╗   ██╗██████╗  ██████╗ ███████╗
   ██╔══██╗██╔══██╗████╗  ██║    ██╔══██╗██║   ██║██╔══██╗██╔════╝ ██╔════╝
@@ -432,13 +526,14 @@ server.listen(PORT, () => {
   console.log(`CDN Provider: ${process.env.CDN_PROVIDER || 'not configured'}`);
   console.log(`CDN Domain: ${process.env.CDN_DOMAIN || 'not configured'}`);
   console.log(`API Key Auth: ${API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Retry: maxRetries=${process.env.PURGE_MAX_RETRIES || 3}, baseDelay=${process.env.PURGE_RETRY_BASE_DELAY || 1000}ms, backoff=${process.env.PURGE_RETRY_BACKOFF_FACTOR || 2}x`);
+  console.log(`Retry: maxRetries=${samplePurger.maxRetries}, baseDelay=${samplePurger.retryBaseDelay}ms, backoff=${samplePurger.retryBackoffFactor}x`);
+  console.log(`Batch: size=${samplePurger.batchSize}/batch (default for ${samplePurger.provider})`);
   console.log(`Failure records: ${recorder.storageDir}`);
   console.log('');
   console.log('Available endpoints:');
   console.log('  GET    /health                    - Health check');
   console.log('  POST   /api/purge                 - Purge single file (with retry)');
-  console.log('  POST   /api/purge-batch           - Purge multiple files (with retry)');
+  console.log('  POST   /api/purge-batch           - Purge multiple files (native batch + retry)');
   console.log('  GET    /api/purge-failures        - Query failure records');
   console.log('  GET    /api/purge-failures/stats  - Get failure statistics');
   console.log('  GET    /api/purge-failures/:id    - Get a single failure record');

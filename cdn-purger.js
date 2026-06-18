@@ -15,6 +15,13 @@ const DEFAULT_RETRYABLE_ERRORS = [
   'ECONNABORTED'
 ];
 
+const BATCH_LIMITS = {
+  aliyun: 1000,
+  tencent: 100,
+  qiniu: 100,
+  cloudflare: 30
+};
+
 class CdnPurger {
   constructor(config) {
     this.provider = config.provider || process.env.CDN_PROVIDER;
@@ -40,6 +47,13 @@ class CdnPurger {
         : 2);
     this.retryableStatusCodes = config.retryableStatusCodes || DEFAULT_RETRYABLE_STATUS_CODES;
     this.retryableErrors = config.retryableErrors || DEFAULT_RETRYABLE_ERRORS;
+
+    const defaultBatchSize = BATCH_LIMITS[this.provider] || 50;
+    this.batchSize = config.batchSize !== undefined
+      ? config.batchSize
+      : (process.env.PURGE_BATCH_SIZE
+        ? parseInt(process.env.PURGE_BATCH_SIZE, 10)
+        : defaultBatchSize);
   }
 
   async purge(filePath) {
@@ -127,6 +141,159 @@ class CdnPurger {
     throw failure;
   }
 
+  async purgeBatch(filePaths) {
+    if (!Array.isArray(filePaths) || filePaths.length === 0) {
+      throw new Error('filePaths array is required');
+    }
+
+    const deduped = [...new Set(filePaths)];
+    const urls = deduped.map((p) => this.buildFullUrl(p));
+
+    switch (this.provider) {
+      case 'aliyun':
+        return this.purgeBatchAliyun(deduped, urls);
+      case 'tencent':
+        return this.purgeBatchTencent(deduped, urls);
+      case 'qiniu':
+        return this.purgeBatchQiniu(deduped, urls);
+      case 'cloudflare':
+        return this.purgeBatchCloudflare(deduped, urls);
+      default:
+        throw new Error(`Unsupported CDN provider: ${this.provider}`);
+    }
+  }
+
+  async purgeBatchWithRetry(filePaths) {
+    if (!Array.isArray(filePaths) || filePaths.length === 0) {
+      throw new Error('filePaths array is required');
+    }
+
+    const deduped = [...new Set(filePaths)];
+    const urlMap = new Map(deduped.map((p) => [p, this.buildFullUrl(p)]));
+
+    const batches = [];
+    for (let i = 0; i < deduped.length; i += this.batchSize) {
+      batches.push(deduped.slice(i, i + this.batchSize));
+    }
+
+    const overallStart = Date.now();
+    const batchResults = [];
+    let allSuccess = true;
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batchPaths = batches[batchIndex];
+      const batchUrls = batchPaths.map((p) => urlMap.get(p));
+      const batchStart = Date.now();
+      let lastError = null;
+      const attempts = [];
+      let batchSuccess = false;
+      let finalResult = null;
+
+      for (let attempt = 1; attempt <= this.maxRetries + 1; attempt++) {
+        const attemptStart = Date.now();
+        try {
+          const result = await this.purgeBatch(batchPaths);
+          attempts.push({
+            attempt,
+            success: true,
+            statusCode: result.statusCode,
+            duration: Date.now() - attemptStart
+          });
+          finalResult = result;
+          batchSuccess = true;
+          break;
+        } catch (error) {
+          const isLast = attempt > this.maxRetries;
+          const errorInfo = this.normalizeError(error);
+          const shouldRetry = !isLast && this.shouldRetry(errorInfo);
+
+          attempts.push({
+            attempt,
+            success: false,
+            statusCode: errorInfo.statusCode,
+            errorCode: errorInfo.code,
+            errorMessage: errorInfo.message,
+            duration: Date.now() - attemptStart,
+            willRetry: shouldRetry
+          });
+
+          lastError = errorInfo;
+
+          if (!shouldRetry) {
+            break;
+          }
+
+          const delay = this.calculateBackoff(attempt);
+          await this.sleep(delay);
+        }
+      }
+
+      const batchOutcome = {
+        batchIndex: batchIndex + 1,
+        totalBatches: batches.length,
+        paths: batchPaths,
+        urls: batchUrls,
+        count: batchPaths.length,
+        success: batchSuccess,
+        retried: attempts.length > 1,
+        attempts,
+        finalAttempt: attempts.length,
+        duration: Date.now() - batchStart
+      };
+
+      if (batchSuccess) {
+        batchOutcome.result = {
+          statusCode: finalResult.statusCode,
+          data: finalResult.data
+        };
+      } else {
+        batchOutcome.error = lastError;
+        batchOutcome.failedPaths = batchPaths;
+        allSuccess = false;
+      }
+
+      batchResults.push(batchOutcome);
+    }
+
+    const successPaths = [];
+    const failedPaths = [];
+    batchResults.forEach((b) => {
+      if (b.success) {
+        successPaths.push(...b.paths);
+      } else {
+        failedPaths.push(...b.paths);
+      }
+    });
+
+    const overall = {
+      success: allSuccess,
+      provider: this.provider,
+      total: deduped.length,
+      batchSize: this.batchSize,
+      totalBatches: batches.length,
+      successCount: successPaths.length,
+      failCount: failedPaths.length,
+      successPaths,
+      failedPaths,
+      batchResults,
+      totalDuration: Date.now() - overallStart,
+      timestamp: new Date().toISOString()
+    };
+
+    if (!allSuccess) {
+      throw overall;
+    }
+    return overall;
+  }
+
+  chunk(arr, size) {
+    const result = [];
+    for (let i = 0; i < arr.length; i += size) {
+      result.push(arr.slice(i, i + size));
+    }
+    return result;
+  }
+
   normalizeError(error) {
     if (!error) {
       return { message: 'Unknown error', code: 'UNKNOWN' };
@@ -190,10 +357,16 @@ class CdnPurger {
   }
 
   async purgeAliyun(url) {
+    return this.purgeBatchAliyun([url], [url]);
+  }
+
+  async purgeBatchAliyun(paths, urls) {
     const action = 'RefreshObjectCaches';
     const version = '2018-05-10';
     const timestamp = new Date().toISOString();
     const nonce = Math.random().toString(36).substring(2, 15);
+
+    const joinedUrls = urls.join('\n');
 
     const params = {
       Action: action,
@@ -204,9 +377,12 @@ class CdnPurger {
       Timestamp: timestamp,
       SignatureVersion: '1.0',
       SignatureNonce: nonce,
-      ObjectPath: url,
-      ObjectType: 'File'
+      ObjectPath: joinedUrls
     };
+
+    if (urls.length === 1) {
+      params.ObjectType = 'File';
+    }
 
     const signature = this.signAliyun(params, this.accessKeySecret);
     params.Signature = signature;
@@ -233,6 +409,10 @@ class CdnPurger {
   }
 
   async purgeTencent(url) {
+    return this.purgeBatchTencent([url], [url]);
+  }
+
+  async purgeBatchTencent(paths, urls) {
     const action = 'PurgeUrlsCache';
     const version = '2018-06-06';
     const service = 'cdn';
@@ -241,7 +421,7 @@ class CdnPurger {
     const date = new Date(timestamp * 1000).toISOString().split('T')[0];
 
     const payload = JSON.stringify({
-      Urls: [url]
+      Urls: urls
     });
 
     const authorization = this.signTencent({
@@ -319,10 +499,14 @@ class CdnPurger {
   }
 
   async purgeQiniu(url) {
+    return this.purgeBatchQiniu([url], [url]);
+  }
+
+  async purgeBatchQiniu(paths, urls) {
     const host = this.endpoint || 'fusion.qiniuapi.com';
     const path = '/v2/tune/refresh';
     const payload = JSON.stringify({
-      urls: [url]
+      urls: urls
     });
 
     const signToken = this.signQiniu(path, payload);
@@ -359,6 +543,10 @@ class CdnPurger {
   }
 
   async purgeCloudflare(url) {
+    return this.purgeBatchCloudflare([url], [url]);
+  }
+
+  async purgeBatchCloudflare(paths, urls) {
     const zoneId = process.env.CLOUDFLARE_ZONE_ID;
     if (!zoneId) {
       throw new Error('CLOUDFLARE_ZONE_ID is required for Cloudflare');
@@ -376,7 +564,7 @@ class CdnPurger {
     };
 
     const payload = JSON.stringify({
-      files: [url]
+      files: urls
     });
 
     return this.makeRequest(options, 'POST', payload);
