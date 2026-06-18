@@ -2,6 +2,19 @@ const https = require('https');
 const crypto = require('crypto');
 const { URL } = require('url');
 
+const DEFAULT_RETRYABLE_STATUS_CODES = [408, 429, 500, 502, 503, 504];
+const DEFAULT_RETRYABLE_ERRORS = [
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'EAI_AGAIN',
+  'EPIPE',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ESOCKETTIMEDOUT',
+  'ECONNABORTED'
+];
+
 class CdnPurger {
   constructor(config) {
     this.provider = config.provider || process.env.CDN_PROVIDER;
@@ -9,6 +22,24 @@ class CdnPurger {
     this.accessKeySecret = config.accessKeySecret || process.env.CDN_ACCESS_KEY_SECRET;
     this.endpoint = config.endpoint || process.env.CDN_ENDPOINT;
     this.domain = config.domain || process.env.CDN_DOMAIN;
+
+    this.maxRetries = config.maxRetries !== undefined
+      ? config.maxRetries
+      : (process.env.PURGE_MAX_RETRIES !== undefined
+        ? parseInt(process.env.PURGE_MAX_RETRIES, 10)
+        : 3);
+    this.retryBaseDelay = config.retryBaseDelay !== undefined
+      ? config.retryBaseDelay
+      : (process.env.PURGE_RETRY_BASE_DELAY
+        ? parseInt(process.env.PURGE_RETRY_BASE_DELAY, 10)
+        : 1000);
+    this.retryBackoffFactor = config.retryBackoffFactor !== undefined
+      ? config.retryBackoffFactor
+      : (process.env.PURGE_RETRY_BACKOFF_FACTOR
+        ? parseFloat(process.env.PURGE_RETRY_BACKOFF_FACTOR)
+        : 2);
+    this.retryableStatusCodes = config.retryableStatusCodes || DEFAULT_RETRYABLE_STATUS_CODES;
+    this.retryableErrors = config.retryableErrors || DEFAULT_RETRYABLE_ERRORS;
   }
 
   async purge(filePath) {
@@ -30,6 +61,127 @@ class CdnPurger {
       default:
         throw new Error(`Unsupported CDN provider: ${this.provider}`);
     }
+  }
+
+  async purgeWithRetry(filePath) {
+    if (!filePath) {
+      throw new Error('File path is required');
+    }
+
+    const fullUrl = this.buildFullUrl(filePath);
+    let lastError = null;
+    const attempts = [];
+
+    for (let attempt = 1; attempt <= this.maxRetries + 1; attempt++) {
+      const attemptStart = Date.now();
+      try {
+        const result = await this.purge(filePath);
+        attempts.push({
+          attempt,
+          success: true,
+          statusCode: result.statusCode,
+          duration: Date.now() - attemptStart
+        });
+        result.attempts = attempts;
+        result.filePath = filePath;
+        result.fullUrl = fullUrl;
+        result.finalAttempt = attempt;
+        result.retried = attempt > 1;
+        return result;
+      } catch (error) {
+        const isLast = attempt > this.maxRetries;
+        const errorInfo = this.normalizeError(error);
+        const shouldRetry = !isLast && this.shouldRetry(errorInfo);
+
+        attempts.push({
+          attempt,
+          success: false,
+          statusCode: errorInfo.statusCode,
+          errorCode: errorInfo.code,
+          errorMessage: errorInfo.message,
+          duration: Date.now() - attemptStart,
+          willRetry: shouldRetry
+        });
+
+        lastError = errorInfo;
+
+        if (!shouldRetry) {
+          break;
+        }
+
+        const delay = this.calculateBackoff(attempt);
+        await this.sleep(delay);
+      }
+    }
+
+    const failure = {
+      success: false,
+      filePath,
+      fullUrl,
+      provider: this.provider,
+      attempts,
+      finalAttempt: attempts.length,
+      error: lastError,
+      timestamp: new Date().toISOString()
+    };
+    throw failure;
+  }
+
+  normalizeError(error) {
+    if (!error) {
+      return { message: 'Unknown error', code: 'UNKNOWN' };
+    }
+
+    if (error.code && this.retryableErrors.includes(error.code)) {
+      return {
+        code: error.code,
+        message: error.message || error.code,
+        isNetworkError: true
+      };
+    }
+
+    if (error.statusCode !== undefined) {
+      return {
+        code: error.code || `HTTP_${error.statusCode}`,
+        statusCode: error.statusCode,
+        message: error.error?.Message || error.error?.message || error.message || `HTTP ${error.statusCode}`,
+        isNetworkError: false
+      };
+    }
+
+    if (error.message) {
+      const matched = this.retryableErrors.find((code) => error.message.includes(code));
+      if (matched) {
+        return { code: matched, message: error.message, isNetworkError: true };
+      }
+      return { code: 'UNKNOWN', message: error.message, isNetworkError: false };
+    }
+
+    return {
+      code: 'UNKNOWN',
+      message: typeof error === 'string' ? error : JSON.stringify(error),
+      isNetworkError: false
+    };
+  }
+
+  shouldRetry(errorInfo) {
+    if (errorInfo.isNetworkError) {
+      return true;
+    }
+    if (errorInfo.statusCode && this.retryableStatusCodes.includes(errorInfo.statusCode)) {
+      return true;
+    }
+    return false;
+  }
+
+  calculateBackoff(attempt) {
+    const delay = this.retryBaseDelay * Math.pow(this.retryBackoffFactor, attempt - 1);
+    const jitter = Math.floor(Math.random() * this.retryBaseDelay * 0.3);
+    return Math.floor(delay + jitter);
+  }
+
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   buildFullUrl(filePath) {
@@ -231,7 +383,13 @@ class CdnPurger {
   }
 
   makeRequest(options, method, body = null) {
+    const timeout = process.env.PURGE_REQUEST_TIMEOUT
+      ? parseInt(process.env.PURGE_REQUEST_TIMEOUT, 10)
+      : 10000;
+
     return new Promise((resolve, reject) => {
+      let settled = false;
+
       const req = https.request(options, (res) => {
         let data = '';
 
@@ -240,6 +398,8 @@ class CdnPurger {
         });
 
         res.on('end', () => {
+          if (settled) return;
+          settled = true;
           try {
             const result = JSON.parse(data);
             if (res.statusCode >= 200 && res.statusCode < 300) {
@@ -265,10 +425,26 @@ class CdnPurger {
         });
       });
 
-      req.on('error', (error) => {
+      req.setTimeout(timeout, () => {
+        if (settled) return;
+        settled = true;
+        req.destroy();
+        const error = new Error(`Request timed out after ${timeout}ms`);
+        error.code = 'ETIMEDOUT';
         reject({
           success: false,
-          error: error.message
+          error: error.message,
+          code: 'ETIMEDOUT'
+        });
+      });
+
+      req.on('error', (error) => {
+        if (settled) return;
+        settled = true;
+        reject({
+          success: false,
+          error: error.message,
+          code: error.code || 'ECONNERROR'
         });
       });
 
