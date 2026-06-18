@@ -1,0 +1,15 @@
+{
+  "name": "cdn-purge-service",
+  "version": "1.0.0",
+  "description": "Node.js HTTP service for CDN cache purge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "keywords": ["cdn", "cache", "purge", "http"],
+  "license": "MIT"
+}
